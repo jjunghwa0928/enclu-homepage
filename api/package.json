@@ -1,0 +1,21 @@
+{
+  "name": "enclu-contact-api",
+  "version": "1.0.0",
+  "private": true,
+  "description": "ENCLU 홈페이지 문의 폼 메일 발송 API (Express + nodemailer)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "express": "^5.1.0",
+    "express-rate-limit": "^7.5.0",
+    "helmet": "^8.1.0",
+    "nodemailer": "^10.2.1"
+  }
+}
