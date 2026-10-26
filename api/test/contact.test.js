@@ -407,7 +407,7 @@ describe('customer ack mail', () => {
     assert.equal(typeof ack.html, 'string');
   });
 
-  test('ack content: brand header, fixed greeting, whitelisted type + time only, SLA, no-reply notice with MAIL_TO, auto-reply headers', async () => {
+  test('ack content: brand name, fixed greeting, whitelisted type + time only, SLA, no-reply notice with MAIL_TO, auto-reply headers', async () => {
     await new Promise((r) => server.close(r));
     await boot({ mailTo: 'help@enclu.co.kr' });
     await request(server, 'POST', '/api/contact', validPayload());
@@ -476,6 +476,52 @@ describe('customer ack mail', () => {
     assert.ok(mail.html.includes('help&amp;ops &lt;x&gt;@enclu.co.kr'));
     assert.ok(!mail.html.includes('help&ops <x>'));
     assert.ok(mail.text.includes('help&ops <x>@enclu.co.kr'));
+  });
+
+  test('ack HTML: Google-style card with hosted logo, blue CTA, grey footer with recipient; user data escaped', () => {
+    const email = "o'neil+<tag>@example.com";
+    const mail = buildCustomerAckMail(baseConfig(), validPayload({ email }), { receivedAt: '2026-10-26T01:02:03.000Z' });
+    const { html, text } = mail;
+
+    // 로고 (호스팅 이미지 + alt 텍스트 폴백)
+    assert.ok(html.includes('src="https://jjunghwa0928.github.io/enclu-homepage/assets/logo-enclu.png"'));
+    assert.ok(html.includes('alt="ENCLU"'));
+
+    // 카드: 회색 배경 위 흰색 카드, #dadce0 테두리, 8px 라운드
+    assert.ok(html.includes('background:#f8f9fa'));
+    assert.ok(html.includes('background:#ffffff;border:1px solid #dadce0;border-radius:8px'));
+    assert.ok(!html.includes('#fef3c7'), 'no amber warning box');
+    assert.ok(!html.includes('background:#111827'), 'no dark brand bar');
+
+    // 파란 CTA 버튼 → 홈페이지
+    assert.ok(html.includes('background:#1a73e8'));
+    assert.ok(html.includes('href="https://www.enclu.com/"'));
+    assert.ok(html.includes('>ENCLU 홈페이지</a>'));
+    assert.ok(text.includes('ENCLU 홈페이지: https://www.enclu.com/'));
+
+    // 푸터
+    for (const body of [html, text]) {
+      assert.ok(body.includes('이 메일은 발신 전용입니다.'));
+    }
+    assert.ok(html.includes('이 메일은 o&#39;neil+&lt;tag&gt;@example.com 으로 발송되었습니다.'));
+    assert.ok(!html.includes(email), 'raw recipient address must not appear unescaped in HTML');
+    assert.ok(text.includes(`이 메일은 ${email} 으로 발송되었습니다.`));
+
+    // 이메일 클라이언트 호환: 테이블 레이아웃·인라인 스타일만 사용
+    assert.ok(!/<style[\s>]/i.test(html));
+    assert.ok(!/<link[\s>]/i.test(html));
+    assert.ok(!/display:\s*(flex|grid)/i.test(html));
+
+    // 텍스트 버전과 HTML 버전의 정보 순서가 같다
+    const order = ['문의가 정상 접수되었습니다', '고객님, ENCLU 에 문의해 주셔서 감사합니다', '문의 유형', '접수 시각', '담당자가 영업일 기준', 'https://www.enclu.com/', '발신 전용(no-reply)', '이 메일은 발신 전용입니다.', '으로 발송되었습니다.'];
+    for (const body of [html, text]) {
+      let last = -1;
+      for (const needle of order) {
+        const idx = body.indexOf(needle, last + 1);
+        assert.ok(idx > last, `${needle} must come after the previous item`);
+        last = idx;
+      }
+    }
   });
 
   test('ack failure is logged only: response stays 200 ok, duplicate guard still recorded', async () => {
