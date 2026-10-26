@@ -14,7 +14,8 @@
  * 담당자(MAIL_TO) 알림 메일이 성공하면 고객(data.email)에게 접수 확인 메일을 추가로 보낸다
  * (CUSTOMER_ACK_ENABLED, 기본 켜짐). 확인 메일은 200 응답을 보낸 뒤 비동기로 발송하며
  * (ACK_TIMEOUT_MS 타임아웃), 실패·타임아웃은 경고 로그만 남긴다.
- * 확인 메일에는 공격자가 임의로 채울 수 있는 자유 입력(성함·회사명·메시지)을 넣지 않는다.
+ * 확인 메일은 접수된 내용(이름·회사·연락처·문의 내용)을 이스케이프해서 그대로 돌려보내며,
+ * 임의 주소로 임의 문구를 중계하는 악용은 수신 주소당 24시간 3통 상한(ACK_PER_EMAIL_LIMIT)으로 막는다.
  *
  * 테스트에서는 createApp({ config, sendMail, verifyTurnstile }) 로
  * 네트워크를 쓰지 않는 가짜 구현을 주입한다.
@@ -44,6 +45,14 @@ const DUPLICATE_WINDOW_MS = 10 * 60 * 1000;
 
 /** 고객 확인 메일 발송 대기 상한. 넘기면 경고 로그만 남기고 잊는다. */
 const ACK_TIMEOUT_MS = 10 * 1000;
+
+/**
+ * 수신 주소당 고객 확인 메일 상한. 확인 메일이 사용자 입력을 그대로 되돌려 보내므로,
+ * 폼을 "임의 주소로 임의 문구를 보내는 중계기"로 쓰는 악용을 주소당 24시간 3통으로 묶는다.
+ * 상한을 넘으면 담당자 알림은 그대로 보내고 확인 메일만 건너뛴다.
+ */
+const ACK_PER_EMAIL_LIMIT = 3;
+const ACK_PER_EMAIL_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 /** 고객 확인 메일의 CTA 링크·로고 (설정에 사이트 URL 항목이 없어 고정값) */
 const ACK_SITE_URL = 'https://www.enclu.com/';
@@ -233,18 +242,23 @@ function formatReceivedAt(iso) {
 
 /**
  * 고객 접수 확인 메일.
- * - 공격자가 임의 주소로 임의 문구를 보내는 데 쓰이지 않도록, 자유 입력(성함·회사명·메시지)은
- *   일절 넣지 않는다. 문의 유형도 INQUIRY_TYPES 와 정확히 일치할 때만 표시한다.
+ * - 접수된 내용(이름·회사·연락처·문의 내용)을 그대로 돌려보낸다. HTML 에 들어가는 값은 전부 escapeHtml 을 거친다.
+ *   문의 유형은 INQUIRY_TYPES 와 정확히 일치할 때만 표시한다.
+ * - 임의 주소로 임의 문구를 중계하는 악용은 createAckLimiter(수신 주소당 24시간 3통)로 제한한다.
  * - Reply-To 를 설정하지 않고 자동응답 헤더를 붙여 메일 루프·부재중 자동회신을 막는다.
  */
 function buildCustomerAckMail(config, data, meta) {
   const receivedAt = formatReceivedAt(meta.receivedAt);
   const contact = config.mailTo;
+  const greeting = `${data.name}님, ENCLU 에 문의해 주셔서 감사합니다. 접수 내역은 아래와 같습니다.`;
   const noReplyNotice = `본 메일은 발신 전용(no-reply)이므로 회신하지 마세요. 추가 문의는 홈페이지 문의 폼 또는 ${contact} 로 보내주세요.`;
   const recipientLine = `이 메일은 ${data.email} 으로 발송되었습니다.`;
 
   const summary = [];
   if (INQUIRY_TYPES.includes(data.type)) summary.push(['문의 유형', data.type]);
+  summary.push(['이름', data.name]);
+  if (data.company) summary.push(['회사', data.company]);
+  if (data.phone) summary.push(['연락처', data.phone]);
   summary.push(['접수 시각', receivedAt]);
 
   const text = [
@@ -252,9 +266,12 @@ function buildCustomerAckMail(config, data, meta) {
     '',
     '문의가 정상 접수되었습니다.',
     '',
-    '고객님, ENCLU 에 문의해 주셔서 감사합니다. 접수 내역은 아래와 같습니다.',
+    greeting,
     '',
     ...summary.map(([k, v]) => `${k}: ${v}`),
+    '',
+    '문의 내용:',
+    data.message,
     '',
     '담당자가 영업일 기준 1~2일 내 연락드립니다.',
     '',
@@ -278,6 +295,15 @@ function buildCustomerAckMail(config, data, meta) {
     )
     .join('');
 
+  // 문의 내용: 줄바꿈 유지(<br>), 연한 회색 라운드 박스
+  const messageHtml = escapeHtml(data.message).replace(/\n/g, '<br />');
+  const messageRow =
+    `<tr><td colspan="2" style="padding:12px 0 0;${font}font-size:14px;line-height:1.6;color:#5f6368;">문의 내용</td></tr>` +
+    '<tr><td colspan="2" style="padding:8px 0 0;">' +
+    '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">' +
+    `<tr><td style="padding:12px 16px;background:#f8f9fa;border-radius:8px;${font}font-size:14px;line-height:1.6;color:#3c4043;">${messageHtml}</td></tr>` +
+    '</table></td></tr>';
+
   const html = [
     '<!DOCTYPE html>',
     '<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>문의 접수 확인</title></head>',
@@ -295,10 +321,10 @@ function buildCustomerAckMail(config, data, meta) {
       '</a></td></tr>',
     // 제목·인사
     `<tr><td align="center" style="padding:0 0 12px;${font}font-size:24px;line-height:1.3;font-weight:700;color:#202124;">문의가 정상 접수되었습니다.</td></tr>`,
-    `<tr><td align="center" style="padding:0 0 28px;${font}font-size:14px;line-height:1.6;color:#3c4043;">고객님, ENCLU 에 문의해 주셔서 감사합니다. 접수 내역은 아래와 같습니다.</td></tr>`,
+    `<tr><td align="center" style="padding:0 0 28px;${font}font-size:14px;line-height:1.6;color:#3c4043;">${escapeHtml(greeting)}</td></tr>`,
     // 접수 내역
     `<tr><td style="padding:0 0 24px;border-top:1px solid #dadce0;border-bottom:1px solid #dadce0;">` +
-      `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin:12px 0 0;">${rows}</table>` +
+      `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin:12px 0 0;">${rows}${messageRow}</table>` +
       '</td></tr>',
     `<tr><td align="center" style="padding:0 0 28px;${font}font-size:14px;line-height:1.6;color:#3c4043;">담당자가 영업일 기준 1~2일 내 연락드립니다.</td></tr>`,
     // CTA
@@ -401,6 +427,51 @@ function createDuplicateGuard(windowMs = DUPLICATE_WINDOW_MS) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// 고객 확인 메일 수신 주소별 상한 (메모리)
+// ---------------------------------------------------------------------------
+
+function createAckLimiter(limit = ACK_PER_EMAIL_LIMIT, windowMs = ACK_PER_EMAIL_WINDOW_MS) {
+  const sent = new Map(); // email(lowercase) -> [timestamp, ...] (창 안의 발송 시각만)
+  let lastPrune = 0;
+
+  function keyOf(email) {
+    return String(email).trim().toLowerCase();
+  }
+
+  function recent(email, now) {
+    const list = (sent.get(keyOf(email)) || []).filter((t) => now - t < windowMs);
+    if (list.length) sent.set(keyOf(email), list);
+    else sent.delete(keyOf(email));
+    return list;
+  }
+
+  function prune(now) {
+    if (now - lastPrune < 60 * 1000) return;
+    lastPrune = now;
+    for (const [k, list] of sent) {
+      const kept = list.filter((t) => now - t < windowMs);
+      if (kept.length) sent.set(k, kept);
+      else sent.delete(k);
+    }
+  }
+
+  return {
+    /** 창 안에 이미 limit 통을 보냈으면 true (= 확인 메일 생략). 기록하지는 않는다. */
+    isExceeded(email, now = Date.now()) {
+      prune(now);
+      return recent(email, now).length >= limit;
+    },
+    /** 확인 메일 발송을 시도할 때 호출 — 실패해도 횟수에 넣는다(실패를 이용한 우회 방지) */
+    remember(email, now = Date.now()) {
+      sent.set(keyOf(email), [...recent(email, now), now]);
+    },
+    size() {
+      return sent.size;
+    }
+  };
+}
+
 /**
  * 기동 전 설정 점검. 문제가 있으면 메시지를 돌려주고, 없으면 null.
  * production 에서 TURNSTILE_SECRET 이 없으면 봇 검증이 통째로 빠지므로 기동을 거부한다.
@@ -454,6 +525,7 @@ function createApp(options = {}) {
   const sendMail = options.sendMail || createSmtpSender(config);
   const verifyTurnstile = options.verifyTurnstile || verifyTurnstileRemote;
   const duplicates = options.duplicateGuard || createDuplicateGuard();
+  const ackLimiter = options.ackLimiter || createAckLimiter();
   const ackTimeoutMs = Number.isFinite(options.ackTimeoutMs) ? options.ackTimeoutMs : ACK_TIMEOUT_MS;
 
   const app = express();
@@ -522,8 +594,14 @@ function createApp(options = {}) {
     res.json({ ok: true });
 
     // 6) 고객 접수 확인 — 응답을 보낸 뒤 비동기로. 실패·타임아웃은 로그만 남긴다 (접수 자체는 이미 완료).
+    //    수신 주소당 24시간 상한을 넘기면 확인 메일만 건너뛴다 (담당자 알림은 이미 발송됨).
     if (config.customerAckEnabled) {
-      sendCustomerAck(sendMail, buildCustomerAckMail(config, data, meta), ackTimeoutMs, ip);
+      if (ackLimiter.isExceeded(data.email)) {
+        log('info', 'ack skipped', { ip, reason: 'per_email_limit' });
+      } else {
+        ackLimiter.remember(data.email);
+        sendCustomerAck(sendMail, buildCustomerAckMail(config, data, meta), ackTimeoutMs, ip);
+      }
     }
   });
 
@@ -582,7 +660,10 @@ module.exports = {
   buildMail,
   buildCustomerAckMail,
   createDuplicateGuard,
+  createAckLimiter,
   LIMITS,
   INQUIRY_TYPES,
-  ACK_TIMEOUT_MS
+  ACK_TIMEOUT_MS,
+  ACK_PER_EMAIL_LIMIT,
+  ACK_PER_EMAIL_WINDOW_MS
 };

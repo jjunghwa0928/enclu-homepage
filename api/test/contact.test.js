@@ -8,7 +8,17 @@ process.env.NODE_ENV = 'test';
 const { test, describe, beforeEach, afterEach } = require('node:test');
 const assert = require('node:assert/strict');
 const http = require('node:http');
-const { createApp, loadConfig, startupError, buildCustomerAckMail, INQUIRY_TYPES, ACK_TIMEOUT_MS } = require('../server');
+const {
+  createApp,
+  loadConfig,
+  startupError,
+  buildCustomerAckMail,
+  createAckLimiter,
+  INQUIRY_TYPES,
+  ACK_TIMEOUT_MS,
+  ACK_PER_EMAIL_LIMIT,
+  ACK_PER_EMAIL_WINDOW_MS
+} = require('../server');
 
 // 테스트 중 서버 로그는 숨긴다
 const origLog = console.log;
@@ -407,51 +417,145 @@ describe('customer ack mail', () => {
     assert.equal(typeof ack.html, 'string');
   });
 
-  test('ack content: brand name, fixed greeting, whitelisted type + time only, SLA, no-reply notice with MAIL_TO, auto-reply headers', async () => {
+  test('ack content: brand name, greeting with name, submitted details echoed, SLA, no-reply notice with MAIL_TO, auto-reply headers', async () => {
     await new Promise((r) => server.close(r));
     await boot({ mailTo: 'help@enclu.co.kr' });
-    await request(server, 'POST', '/api/contact', validPayload());
+    await request(server, 'POST', '/api/contact', validPayload({ message: '일본 진출을 고민 중입니다.\n두 번째 줄입니다.' }));
     await waitForCalls(2);
     const ack = calls[1];
 
     for (const body of [ack.text, ack.html]) {
       assert.ok(body.includes('ENCLU'));
       assert.ok(body.includes('문의가 정상 접수되었습니다'));
-      assert.ok(body.includes('고객님, ENCLU 에 문의해 주셔서 감사합니다'));
+      assert.ok(body.includes('홍길동님, ENCLU 에 문의해 주셔서 감사합니다'));
       assert.ok(body.includes('문의 유형'));
       assert.ok(body.includes('브랜드 입점 문의'), 'whitelisted type is shown');
+      assert.ok(body.includes('이름'));
+      assert.ok(body.includes('회사'));
+      assert.ok(body.includes('(주)엔클루'));
+      assert.ok(body.includes('연락처'));
+      assert.ok(body.includes('010-0000-0000'));
       assert.ok(body.includes('접수 시각'));
+      assert.ok(body.includes('문의 내용'));
+      assert.ok(body.includes('일본 진출을 고민 중입니다.'), 'customer message is echoed back');
       assert.ok(body.includes('담당자가 영업일 기준 1~2일 내 연락드립니다'));
       assert.ok(body.includes('발신 전용(no-reply)이므로 회신하지 마세요'));
       assert.ok(body.includes('홈페이지 문의 폼 또는 help@enclu.co.kr'));
-      // 자유 입력은 어떤 형태로도 되돌려 보내지 않는다
-      assert.ok(!body.includes('회사명'));
-      assert.ok(!body.includes('성함'));
-      assert.ok(!body.includes('(주)엔클루'));
-      assert.ok(!body.includes('홍길동'));
-      assert.ok(!body.includes('일본 진출을 고민 중입니다.'), 'customer message must not be echoed back');
     }
+    // key/value order is the same in both versions
+    const order = ['문의 유형', '이름', '회사', '연락처', '접수 시각', '문의 내용'];
+    for (const body of [ack.text, ack.html]) {
+      let last = -1;
+      for (const needle of order) {
+        const idx = body.indexOf(needle, last + 1);
+        assert.ok(idx > last, `${needle} must come after the previous item`);
+        last = idx;
+      }
+    }
+    // line breaks: raw in text, <br> in HTML
+    assert.ok(ack.text.includes('일본 진출을 고민 중입니다.\n두 번째 줄입니다.'));
+    assert.ok(ack.html.includes('일본 진출을 고민 중입니다.<br />두 번째 줄입니다.'));
+    assert.ok(ack.html.includes('background:#f8f9fa;border-radius:8px'), 'message box');
 
     assert.equal(ack.headers['Auto-Submitted'], 'auto-replied');
     assert.equal(ack.headers['X-Auto-Response-Suppress'], 'All');
   });
 
-  test('ack never contains attacker-controlled free text (name, company, non-whitelisted type)', async () => {
-    const name = 'ATTACKER-NAME-9f3a 긴급 안내 http://evil.example/login';
-    const company = 'ATTACKER-CO-7b2c <a href="http://evil.example">click</a>';
+  test('ack echoes user-written text HTML-escaped; non-whitelisted type row is still omitted', async () => {
+    const name = '홍<script>alert(1)</script>';
+    const company = 'ATTACKER-CO <a href="http://evil.example">click</a>';
+    const message = '<img src=x onerror="alert(1)">\n"quoted" & \'single\'';
     const type = '기타 — 계정 정지 예정 http://evil.example';
-    const res = await request(server, 'POST', '/api/contact', validPayload({ name, company, type }));
+    const res = await request(server, 'POST', '/api/contact', validPayload({ name, company, message, type }));
     assert.equal(res.status, 200);
     await waitForCalls(2);
     const ack = calls[1];
 
+    // HTML: 태그·따옴표가 전부 이스케이프되어 마크업으로 해석되지 않는다
+    assert.ok(ack.html.includes('홍&lt;script&gt;alert(1)&lt;/script&gt;님, ENCLU 에 문의해 주셔서 감사합니다'));
+    assert.ok(ack.html.includes('ATTACKER-CO &lt;a href=&quot;http://evil.example&quot;&gt;click&lt;/a&gt;'));
+    assert.ok(ack.html.includes('&lt;img src=x onerror=&quot;alert(1)&quot;&gt;<br />&quot;quoted&quot; &amp; &#39;single&#39;'));
+    assert.ok(!ack.html.includes('<script>'));
+    assert.ok(!ack.html.includes('<img src=x'));
+    assert.ok(!ack.html.includes('<a href="http://evil.example"'));
+    assert.ok(!ack.html.includes('onerror="'));
+
+    // text: 그대로
+    assert.ok(ack.text.includes('이름: 홍<script>alert(1)</script>'));
+    assert.ok(ack.text.includes(message));
+
+    // 문의 유형은 여전히 화이트리스트에 있을 때만
     for (const body of [ack.text, ack.html]) {
-      for (const needle of ['ATTACKER-NAME-9f3a', 'ATTACKER-CO-7b2c', 'evil.example', '계정 정지', '긴급 안내', '&lt;a href']) {
-        assert.ok(!body.includes(needle), `must not contain ${needle}`);
-      }
       assert.ok(!body.includes('문의 유형'), 'non-whitelisted type → row omitted entirely');
+      assert.ok(!body.includes('계정 정지'));
       assert.ok(body.includes('접수 시각'), 'time row is kept');
     }
+  });
+
+  test('createAckLimiter: 3 per address per 24h, case-insensitive, expires after the window', () => {
+    assert.equal(ACK_PER_EMAIL_LIMIT, 3);
+    assert.equal(ACK_PER_EMAIL_WINDOW_MS, 24 * 60 * 60 * 1000);
+    const lim = createAckLimiter();
+    const t0 = 1_000_000;
+
+    for (let i = 0; i < 3; i++) {
+      assert.equal(lim.isExceeded('Hong@Example.com', t0 + i), false, `send #${i + 1} allowed`);
+      lim.remember('Hong@Example.com', t0 + i);
+    }
+    assert.equal(lim.isExceeded('hong@example.com', t0 + 10), true, '4th within window is blocked (case-insensitive)');
+    assert.equal(lim.isExceeded('HONG@EXAMPLE.COM ', t0 + 10), true);
+    assert.equal(lim.isExceeded('other@example.com', t0 + 10), false, 'other address unaffected');
+    assert.equal(lim.size(), 1);
+
+    // 첫 발송이 창 밖으로 나가면 한 통 더 허용
+    assert.equal(lim.isExceeded('hong@example.com', t0 + ACK_PER_EMAIL_WINDOW_MS - 1), true, 'all 3 still inside the window');
+    assert.equal(lim.isExceeded('hong@example.com', t0 + ACK_PER_EMAIL_WINDOW_MS), false, 'first one expired → one more allowed');
+    lim.remember('hong@example.com', t0 + ACK_PER_EMAIL_WINDOW_MS);
+    assert.equal(lim.isExceeded('hong@example.com', t0 + ACK_PER_EMAIL_WINDOW_MS), true, 'back to 3 inside the window');
+
+    // 모두 만료되면 비워진다
+    assert.equal(lim.isExceeded('hong@example.com', t0 + 2 * ACK_PER_EMAIL_WINDOW_MS + 10), false);
+    assert.equal(lim.size(), 0);
+  });
+
+  test('per-email ack limit: 3 acks allowed, 4th skipped with "ack skipped" log, staff mail still sent', async () => {
+    const lines = [];
+    console.log = (...a) => lines.push(a.map(String).join(' '));
+    try {
+      for (let i = 1; i <= 4; i++) {
+        const email = i % 2 ? 'hong@example.com' : 'HONG@example.com'; // 대소문자 섞어도 같은 주소로 센다
+        const res = await request(server, 'POST', '/api/contact', validPayload({ email, message: `문의 ${i}` }));
+        assert.equal(res.status, 200, `request #${i}`);
+        assert.deepEqual(res.json, { ok: true });
+        await waitForCalls(i <= 3 ? 2 * i : 7);
+        await tick();
+      }
+    } finally {
+      console.log = () => {};
+    }
+
+    const staff = calls.filter((m) => m.to === 'info@enclu.co.kr');
+    const acks = calls.filter((m) => m.to.toLowerCase() === 'hong@example.com');
+    assert.equal(staff.length, 4, 'every submission reaches the staff');
+    assert.equal(acks.length, 3, 'only 3 acks per address');
+    assert.equal(calls.length, 7);
+    const skipped = lines.filter((l) => l.includes('ack skipped'));
+    assert.equal(skipped.length, 1);
+    assert.ok(skipped[0].includes('"reason":"per_email_limit"'));
+    assert.ok(!skipped[0].includes('hong@example.com'), 'address is not logged');
+  });
+
+  test('per-email ack limit: limiter is injectable via options.ackLimiter', async () => {
+    await new Promise((r) => server.close(r));
+    await boot({}, undefined, { ackLimiter: createAckLimiter(1) });
+
+    await request(server, 'POST', '/api/contact', validPayload({ message: '첫 번째' }));
+    await waitForCalls(2);
+    await request(server, 'POST', '/api/contact', validPayload({ message: '두 번째' }));
+    await waitForCalls(3);
+    await tick();
+    assert.equal(calls.length, 3, 'staff, ack, staff — second ack skipped');
+    assert.equal(calls[2].to, 'info@enclu.co.kr');
   });
 
   test('type whitelist matches index.html options exactly', () => {
@@ -513,7 +617,7 @@ describe('customer ack mail', () => {
     assert.ok(!/display:\s*(flex|grid)/i.test(html));
 
     // 텍스트 버전과 HTML 버전의 정보 순서가 같다
-    const order = ['문의가 정상 접수되었습니다', '고객님, ENCLU 에 문의해 주셔서 감사합니다', '문의 유형', '접수 시각', '담당자가 영업일 기준', 'https://www.enclu.com/', '발신 전용(no-reply)', '이 메일은 발신 전용입니다.', '으로 발송되었습니다.'];
+    const order = ['문의가 정상 접수되었습니다', '홍길동님, ENCLU 에 문의해 주셔서 감사합니다', '문의 유형', '이름', '회사', '연락처', '접수 시각', '문의 내용', '담당자가 영업일 기준', 'https://www.enclu.com/', '발신 전용(no-reply)', '이 메일은 발신 전용입니다.', '으로 발송되었습니다.'];
     for (const body of [html, text]) {
       let last = -1;
       for (const needle of order) {
