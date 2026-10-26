@@ -3,6 +3,11 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<!-- 보안 헤더: 인라인 스크립트/스타일이 많은 파일이라 'unsafe-inline' 유지. Turnstile(Cloudflare)과 Pretendard 폰트(jsdelivr)만 외부 허용 -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' https://challenges.cloudflare.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; font-src 'self' https://cdn.jsdelivr.net; img-src 'self' data:; connect-src 'self' https://challenges.cloudflare.com; frame-src https://challenges.cloudflare.com; object-src 'none'; base-uri 'self'; form-action 'self'">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<!-- Cloudflare Turnstile 사이트 키 — 여기 한 곳만 수정. 비워 두면 위젯을 렌더링하지 않고 토큰 없이 전송 -->
+<meta name="turnstile-sitekey" content="">
 <title>ENCLU — 일본 시장 진출, 어떻게 성장하느냐가 중요합니다.</title>
 <link rel="preconnect" href="https://cdn.jsdelivr.net">
 <link href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/variable/pretendardvariable-dynamic-subset.min.css" rel="stylesheet">
@@ -345,10 +350,22 @@
   .form-group input:focus,.form-group select:focus,.form-group textarea:focus{outline:2px solid var(--blue);border-color:var(--blue);}
   .consent{display:flex;gap:10px;align-items:flex-start;font-size:13.5px;color:var(--sub);line-height:1.6;}
   .consent input{margin-top:3px;accent-color:var(--blue);}
-  .submit-btn{border:none;cursor:pointer;font-family:inherit;font-size:17px;font-weight:600;color:#fff;background:var(--ink);padding:15px;border-radius:12px;transition:background .2s;}
+  .submit-btn{border:none;cursor:pointer;font-family:inherit;font-size:17px;font-weight:600;color:#fff;background:var(--ink);padding:15px;border-radius:12px;transition:background .2s, opacity .2s;}
   .submit-btn:hover{background:var(--blue);}
+  .submit-btn:disabled{cursor:default;opacity:.55;background:var(--ink);}
   .send-note{margin:0;font-size:13.5px;color:#a1a1a6;text-align:center;}
   .send-note a{color:var(--blue);}
+  /* 허니팟: 사람 눈/탭 순서/스크린리더에서 모두 숨김. 봇이 채우면 서버가 조용히 버림 */
+  .hp-field{position:absolute;left:-9999px;top:auto;width:1px;height:1px;overflow:hidden;opacity:0;pointer-events:none;}
+  .contact-form{position:relative;}
+  .turnstile-box{display:flex;justify-content:center;min-height:0;}
+  .turnstile-box:empty{display:none;}
+  /* 전송 상태 메시지: 버튼 아래 인라인, 페이드+슬라이드 */
+  .form-status{margin:-20px 0 0;font-size:14px;line-height:1.5;text-align:center;max-height:0;overflow:hidden;opacity:0;transform:translateY(-6px);transition:opacity .3s ease, transform .3s ease, max-height .3s ease, margin .3s ease;}
+  .form-status.show{margin:0;max-height:120px;opacity:1;transform:translateY(0);}
+  .form-status.is-sending{color:var(--sub);}
+  .form-status.is-ok{color:#1a8f3c;}
+  .form-status.is-err{color:#d93025;}
 
   /* ---------- FOOTER ---------- */
   footer{background:var(--gray);padding:56px 24px 36px;}
@@ -388,6 +405,7 @@
   [data-reveal].pre.in{opacity:1;transform:translateY(0);}
   @media (prefers-reduced-motion: reduce){
     [data-reveal]{opacity:1!important;transform:none!important;transition:none!important;}
+    .form-status,.submit-btn{transition:none!important;transform:none!important;}
     html{scroll-behavior:auto;}
   }
 
@@ -896,9 +914,16 @@
           <label>문의 내용</label>
           <textarea name="message" required rows="5" placeholder="어떤 제품으로 일본 진출을 고민 중이신가요? 편하게 적어 주세요."></textarea>
         </div>
-        <label class="consent"><input type="checkbox" required>문의 응대를 위한 개인정보 수집·이용에 동의합니다.</label>
-        <button type="submit" class="submit-btn">문의 보내기</button>
-        <p class="send-note">보내기를 누르면 메일 앱이 열려요 · 문의 <a href="mailto:info@enclu.co.kr">info@enclu.co.kr</a></p>
+        <label class="consent"><input type="checkbox" name="consent" required>문의 응대를 위한 개인정보 수집·이용에 동의합니다.</label>
+        <!-- 허니팟 (사람은 보지 못함) -->
+        <div class="hp-field" aria-hidden="true">
+          <label>Website<input type="text" name="website" tabindex="-1" autocomplete="off"></label>
+        </div>
+        <!-- Cloudflare Turnstile: 사이트 키는 <head>의 meta[name=turnstile-sitekey]에서 읽어 렌더링 -->
+        <div class="turnstile-box" id="turnstileBox"><div class="cf-turnstile" data-sitekey="TURNSTILE_SITE_KEY_PLACEHOLDER"></div></div>
+        <button type="submit" class="submit-btn" id="contactSubmit">문의 보내기</button>
+        <p class="form-status" id="formStatus" role="status" aria-live="polite"></p>
+        <p class="send-note">문의가 접수되면 영업일 기준 하루 안에 답변드려요 · 문의 <a href="mailto:info@enclu.co.kr">info@enclu.co.kr</a></p>
       </form>
     </div>
   </section>
@@ -990,14 +1015,153 @@
     overlay.classList.remove('open');
   }
 
-  // ---------- Contact form (mailto) ----------
-  document.getElementById('contactForm').addEventListener('submit', e => {
-    e.preventDefault();
-    const f = new FormData(e.target);
-    const subject = `[홈페이지 문의] ${f.get('type')} - ${f.get('company')}`;
-    const body = `문의 유형: ${f.get('type')}\n회사명: ${f.get('company')}\n성함: ${f.get('name')}\n이메일: ${f.get('email')}\n연락처: ${f.get('phone') || '-'}\n\n문의 내용:\n${f.get('message')}`;
-    window.location.href = `mailto:info@enclu.co.kr?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
-  });
+  // ---------- Contact form (POST /api/contact, mailto fallback) ----------
+  (function(){
+    const form = document.getElementById('contactForm');
+    const btn = document.getElementById('contactSubmit');
+    const statusEl = document.getElementById('formStatus');
+    const tsBox = document.getElementById('turnstileBox');
+    const MAIL_TO = 'info@enclu.co.kr';
+    const API_URL = '/api/contact';
+    const LIMITS = {company:100, name:100, email:200, phone:30, message:3000};
+    const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    const MIN_PAGE_AGE_MS = 3000;   // 페이지 로드 후 3초 안의 전송은 봇으로 간주
+    const COOLDOWN_MS = 30000;      // 성공 후 30초 재전송 금지
+    const loadedAt = Date.now();
+    let sending = false, cooldownUntil = 0, cooldownTimer = null, widgetId = null;
+
+    // Turnstile: <meta name="turnstile-sitekey"> 가 비어 있으면 스크립트를 불러오지 않고 위젯도 제거, 토큰 없이 전송
+    const metaKey = document.querySelector('meta[name="turnstile-sitekey"]');
+    const siteKey = (metaKey && metaKey.content || '').trim();
+    const tsEl = tsBox ? tsBox.querySelector('.cf-turnstile') : null;
+    window.encluTurnstileReady = function(){
+      if(!siteKey || !tsEl || !window.turnstile || widgetId !== null) return;
+      try{ widgetId = window.turnstile.render(tsEl, {sitekey: siteKey, theme:'light', language:'ko'}); }
+      catch(_){ widgetId = null; }
+    };
+    if(!siteKey){
+      if(tsBox) tsBox.innerHTML = '';
+    } else if(tsEl){
+      tsEl.setAttribute('data-sitekey', siteKey);
+      // 사이트 키가 있을 때만 Cloudflare 스크립트를 동적으로 로드 (explicit render)
+      const s = document.createElement('script');
+      s.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit&onload=encluTurnstileReady';
+      s.async = true; s.defer = true;
+      document.head.appendChild(s);
+    }
+
+    function setStatus(kind, text){
+      statusEl.className = 'form-status' + (kind ? ' show is-' + kind : '');
+      statusEl.textContent = text || '';
+    }
+    function clearStatus(){ setStatus('', ''); }
+
+    function setCooldown(ms){
+      cooldownUntil = Date.now() + ms;
+      btn.disabled = true;
+      clearTimeout(cooldownTimer);
+      cooldownTimer = setTimeout(() => { btn.disabled = false; }, ms);
+    }
+
+    function readForm(){
+      const f = new FormData(form);
+      const v = n => String(f.get(n) || '').trim();
+      return {
+        type: v('type'), company: v('company'), name: v('name'), email: v('email'),
+        phone: v('phone'), message: String(f.get('message') || '').trim(),
+        consent: !!form.elements.consent.checked, website: v('website')
+      };
+    }
+
+    // 서버와 같은 기준의 클라이언트 검증
+    function validate(d){
+      if(!d.company || !d.name || !d.email || !d.message) return '필수 항목을 모두 입력해 주세요.';
+      for(const k in LIMITS){ if(d[k] && d[k].length > LIMITS[k]) return '입력이 너무 깁니다. 내용을 줄여 주세요. (문의 내용 3,000자 이내)'; }
+      if(!EMAIL_RE.test(d.email) || /[\r\n]/.test(d.email)) return '이메일 주소 형식을 확인해 주세요.';
+      if(/[\r\n]/.test(d.company + d.name + d.phone)) return '회사명·성함·연락처에는 줄바꿈을 넣을 수 없어요.';
+      if(!d.consent) return '개인정보 수집·이용에 동의해 주세요.';
+      return '';
+    }
+
+    // GitHub Pages 등 API 가 없는 환경 → 기존 mailto 동작으로 폴백
+    function fallbackMailto(d){
+      const subject = `[홈페이지 문의] ${d.type} - ${d.company}`;
+      const body = `문의 유형: ${d.type}\n회사명: ${d.company}\n성함: ${d.name}\n이메일: ${d.email}\n연락처: ${d.phone || '-'}\n\n문의 내용:\n${d.message}`;
+      setStatus('ok', '메일 앱으로 연결했어요. 메일을 보내 주시면 영업일 기준 하루 안에 답변드릴게요.');
+      window.location.href = `mailto:${MAIL_TO}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+    }
+
+    function errorMessage(status, json){
+      const code = json && json.error;
+      if(code === 'captcha_failed') return '보안 확인에 실패했어요. 다시 시도해 주세요.';
+      if(code === 'duplicate') return '같은 내용의 문의가 방금 접수되었어요. 잠시 후 다시 확인해 주세요.';
+      if(status === 429 || code === 'rate_limited') return '요청이 너무 잦아요. 잠시 후 다시 시도해 주세요.';
+      if(status === 400) return '입력 내용을 다시 확인해 주세요.';
+      return `전송에 실패했어요. 잠시 후 다시 시도하거나 ${MAIL_TO} 로 메일 주세요.`;
+    }
+
+    function resetTurnstile(){
+      if(widgetId !== null && window.turnstile){ try{ window.turnstile.reset(widgetId); }catch(_){} }
+    }
+
+    form.addEventListener('submit', async e => {
+      e.preventDefault();
+      if(sending) return;
+      const now = Date.now();
+      if(now - loadedAt < MIN_PAGE_AGE_MS){ setStatus('err', '잠시 후 다시 시도해 주세요.'); return; }
+      if(now < cooldownUntil){ setStatus('err', `잠시 후 다시 보내 주세요. (${Math.ceil((cooldownUntil - now) / 1000)}초)`); return; }
+
+      const data = readForm();
+      const err = validate(data);
+      if(err){ setStatus('err', err); return; }
+
+      if(siteKey){
+        let token = '';
+        if(widgetId !== null && window.turnstile){ try{ token = window.turnstile.getResponse(widgetId) || ''; }catch(_){} }
+        if(!token){ setStatus('err', '보안 확인이 끝날 때까지 잠시 기다려 주세요.'); return; }
+        data.turnstileToken = token;
+      }
+
+      sending = true;
+      btn.disabled = true;
+      setStatus('sending', '보내는 중…');
+
+      let res, json = null;
+      try{
+        res = await fetch(API_URL, {
+          method:'POST', credentials:'same-origin',
+          headers:{'Content-Type':'application/json', 'Accept':'application/json'},
+          body: JSON.stringify(data)
+        });
+      }catch(_){
+        // 네트워크 오류 (오프라인, API 미기동 등) → mailto 폴백
+        sending = false; btn.disabled = false;
+        fallbackMailto(data);
+        return;
+      }
+      try{ json = await res.json(); }catch(_){ json = null; }
+
+      sending = false;
+      // API 가 없는 환경(GitHub Pages 404/405, IIS 프록시 미설정 등)은 JSON 이 아닌 응답이 온다 → mailto 폴백
+      if(res.status === 404 || res.status === 405 || json === null){
+        btn.disabled = false;
+        fallbackMailto(data);
+        return;
+      }
+      if(res.ok && json.ok){
+        form.reset();
+        resetTurnstile();
+        setStatus('ok', '문의가 접수되었어요. 영업일 기준 하루 안에 답변드릴게요.');
+        setCooldown(COOLDOWN_MS);
+        return;
+      }
+      btn.disabled = false;
+      resetTurnstile();
+      setStatus('err', errorMessage(res.status, json));
+    });
+
+    form.addEventListener('input', () => { if(statusEl.classList.contains('is-err')) clearStatus(); });
+  })();
 
   // ---------- Count-up ----------
   function countUp(el){
@@ -1219,5 +1383,6 @@
   }
 })();
 </script>
+<!-- Cloudflare Turnstile 스크립트는 meta[name=turnstile-sitekey] 가 비어 있지 않을 때만 문의 폼 스크립트가 동적으로 로드한다 -->
 </body>
 </html>
