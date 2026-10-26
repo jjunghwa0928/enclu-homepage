@@ -8,7 +8,7 @@ process.env.NODE_ENV = 'test';
 const { test, describe, beforeEach, afterEach } = require('node:test');
 const assert = require('node:assert/strict');
 const http = require('node:http');
-const { createApp, loadConfig, startupError } = require('../server');
+const { createApp, loadConfig, startupError, buildCustomerAckMail, INQUIRY_TYPES, ACK_TIMEOUT_MS } = require('../server');
 
 // 테스트 중 서버 로그는 숨긴다
 const origLog = console.log;
@@ -27,6 +27,8 @@ function baseConfig(overrides = {}) {
     mailFrom: 'noreply@enclu.co.kr',
     turnstileSecret: '',
     allowedOrigins: [],
+    // 기본 테스트는 담당자 알림 1통만 검사한다. 고객 확인 메일은 아래 'customer ack mail' 블록에서 켜고 검사.
+    customerAckEnabled: false,
     ...overrides
   };
 }
@@ -328,5 +330,240 @@ describe('contact api', () => {
     const res = await request(server, 'GET', '/api/nope');
     assert.equal(res.status, 404);
     assert.equal(res.json.error, 'not_found');
+  });
+});
+
+describe('customer ack mail', () => {
+  let server;
+  let calls; // sendMail 에 들어온 모든 호출 (성공·실패·대기 포함)
+  let sent; // 실제로 resolve 된 메일
+  let waiters;
+
+  const tick = (ms = 0) => new Promise((r) => setTimeout(r, ms));
+
+  /** sendMail 이 n 번 호출될 때까지 기다린다 — 고객 확인 메일은 응답 뒤 비동기로 나가므로 이걸로 동기화 */
+  function waitForCalls(n) {
+    return new Promise((resolve) => {
+      if (calls.length >= n) return resolve();
+      waiters.push({ n, resolve });
+    });
+  }
+
+  /**
+   * behavior(mail, callNo) 는 n 번째 호출의 동작을 바꿀 때만 넘긴다:
+   * throw → 실패, 영원히 pending 인 Promise 반환 → 멈춤, 그 외 → 성공.
+   */
+  async function boot(configOverrides = {}, behavior, appOptions = {}) {
+    calls = [];
+    sent = [];
+    waiters = [];
+    const app = createApp({
+      config: baseConfig({ customerAckEnabled: true, ...configOverrides }),
+      sendMail: async (mail) => {
+        calls.push(mail);
+        const n = calls.length;
+        waiters = waiters.filter((w) => {
+          if (n >= w.n) {
+            w.resolve();
+            return false;
+          }
+          return true;
+        });
+        if (behavior) await behavior(mail, n);
+        sent.push(mail);
+        return { messageId: 'fake' };
+      },
+      verifyTurnstile: async () => true,
+      ...appOptions
+    });
+    server = await listen(app);
+  }
+
+  beforeEach(() => boot());
+  afterEach(() => new Promise((r) => server.close(r)));
+
+  test('loadConfig: CUSTOMER_ACK_ENABLED defaults to true, "false" disables', () => {
+    assert.equal(loadConfig({}).customerAckEnabled, true);
+    assert.equal(loadConfig({ CUSTOMER_ACK_ENABLED: '' }).customerAckEnabled, true);
+    assert.equal(loadConfig({ CUSTOMER_ACK_ENABLED: 'true' }).customerAckEnabled, true);
+    assert.equal(loadConfig({ CUSTOMER_ACK_ENABLED: 'false' }).customerAckEnabled, false);
+    assert.equal(loadConfig({ CUSTOMER_ACK_ENABLED: 'FALSE' }).customerAckEnabled, false);
+  });
+
+  test('ack goes out as the second sendMail call, to the customer, after the staff mail', async () => {
+    const res = await request(server, 'POST', '/api/contact', validPayload());
+    assert.equal(res.status, 200);
+    assert.deepEqual(res.json, { ok: true });
+
+    await waitForCalls(2);
+    assert.equal(calls.length, 2);
+    assert.equal(calls[0].to, 'info@enclu.co.kr', 'staff notification first');
+    const ack = calls[1];
+    assert.equal(ack.to, 'hong@example.com');
+    assert.equal(ack.from, 'noreply@enclu.co.kr');
+    assert.equal(ack.replyTo, undefined, 'no Reply-To on the auto-reply');
+    assert.equal(ack.subject, '[ENCLU] 문의가 정상 접수되었습니다');
+    assert.equal(typeof ack.text, 'string');
+    assert.equal(typeof ack.html, 'string');
+  });
+
+  test('ack content: brand header, fixed greeting, whitelisted type + time only, SLA, no-reply notice with MAIL_TO, auto-reply headers', async () => {
+    await new Promise((r) => server.close(r));
+    await boot({ mailTo: 'help@enclu.co.kr' });
+    await request(server, 'POST', '/api/contact', validPayload());
+    await waitForCalls(2);
+    const ack = calls[1];
+
+    for (const body of [ack.text, ack.html]) {
+      assert.ok(body.includes('ENCLU'));
+      assert.ok(body.includes('문의가 정상 접수되었습니다'));
+      assert.ok(body.includes('고객님, ENCLU 에 문의해 주셔서 감사합니다'));
+      assert.ok(body.includes('문의 유형'));
+      assert.ok(body.includes('브랜드 입점 문의'), 'whitelisted type is shown');
+      assert.ok(body.includes('접수 시각'));
+      assert.ok(body.includes('담당자가 영업일 기준 1~2일 내 연락드립니다'));
+      assert.ok(body.includes('발신 전용(no-reply)이므로 회신하지 마세요'));
+      assert.ok(body.includes('홈페이지 문의 폼 또는 help@enclu.co.kr'));
+      // 자유 입력은 어떤 형태로도 되돌려 보내지 않는다
+      assert.ok(!body.includes('회사명'));
+      assert.ok(!body.includes('성함'));
+      assert.ok(!body.includes('(주)엔클루'));
+      assert.ok(!body.includes('홍길동'));
+      assert.ok(!body.includes('일본 진출을 고민 중입니다.'), 'customer message must not be echoed back');
+    }
+
+    assert.equal(ack.headers['Auto-Submitted'], 'auto-replied');
+    assert.equal(ack.headers['X-Auto-Response-Suppress'], 'All');
+  });
+
+  test('ack never contains attacker-controlled free text (name, company, non-whitelisted type)', async () => {
+    const name = 'ATTACKER-NAME-9f3a 긴급 안내 http://evil.example/login';
+    const company = 'ATTACKER-CO-7b2c <a href="http://evil.example">click</a>';
+    const type = '기타 — 계정 정지 예정 http://evil.example';
+    const res = await request(server, 'POST', '/api/contact', validPayload({ name, company, type }));
+    assert.equal(res.status, 200);
+    await waitForCalls(2);
+    const ack = calls[1];
+
+    for (const body of [ack.text, ack.html]) {
+      for (const needle of ['ATTACKER-NAME-9f3a', 'ATTACKER-CO-7b2c', 'evil.example', '계정 정지', '긴급 안내', '&lt;a href']) {
+        assert.ok(!body.includes(needle), `must not contain ${needle}`);
+      }
+      assert.ok(!body.includes('문의 유형'), 'non-whitelisted type → row omitted entirely');
+      assert.ok(body.includes('접수 시각'), 'time row is kept');
+    }
+  });
+
+  test('type whitelist matches index.html options exactly', () => {
+    assert.deepEqual(INQUIRY_TYPES, ['브랜드 입점 문의', '플랫폼 제휴 문의', 'Weedy 관련 문의', '수출바우처 문의', '기타']);
+    const meta = { receivedAt: '2026-10-26T01:02:03.000Z' };
+    for (const type of INQUIRY_TYPES) {
+      const mail = buildCustomerAckMail(baseConfig(), { ...validPayload(), type }, meta);
+      assert.ok(mail.text.includes(`문의 유형: ${type}`), type);
+      assert.ok(mail.html.includes(type), type);
+    }
+    for (const type of ['기타 ', '브랜드 입점 문의!', 'etc', '']) {
+      const mail = buildCustomerAckMail(baseConfig(), { ...validPayload(), type }, meta);
+      assert.ok(!mail.text.includes('문의 유형'), JSON.stringify(type));
+      assert.ok(!mail.html.includes('문의 유형'), JSON.stringify(type));
+    }
+  });
+
+  test('ack HTML escapes every interpolated value (contact address), text stays raw', () => {
+    const mail = buildCustomerAckMail(baseConfig({ mailTo: 'help&ops <x>@enclu.co.kr' }), validPayload(), {
+      receivedAt: '2026-10-26T01:02:03.000Z'
+    });
+    assert.ok(mail.html.includes('help&amp;ops &lt;x&gt;@enclu.co.kr'));
+    assert.ok(!mail.html.includes('help&ops <x>'));
+    assert.ok(mail.text.includes('help&ops <x>@enclu.co.kr'));
+  });
+
+  test('ack failure is logged only: response stays 200 ok, duplicate guard still recorded', async () => {
+    await new Promise((r) => server.close(r));
+    await boot({}, async (mail, n) => {
+      if (n === 2) {
+        const e = new Error('550 mailbox unavailable');
+        e.code = 'EENVELOPE';
+        throw e;
+      }
+    });
+
+    const res = await request(server, 'POST', '/api/contact', validPayload());
+    assert.equal(res.status, 200);
+    assert.deepEqual(res.json, { ok: true });
+    assert.ok(!res.raw.includes('mailbox unavailable'));
+
+    await waitForCalls(2);
+    await tick();
+    assert.equal(calls.length, 2, 'ack was attempted');
+    assert.equal(sent.length, 1, 'only the staff mail went through');
+
+    const again = await request(server, 'POST', '/api/contact', validPayload());
+    assert.equal(again.status, 429, 'staff mail succeeded, so the duplicate guard applies');
+  });
+
+  test('ack hanging forever does not block the response; times out with a warn log', async () => {
+    await new Promise((r) => server.close(r));
+    assert.equal(ACK_TIMEOUT_MS, 10000, 'production default');
+    const ackTimeoutMs = 200;
+    await boot({}, (mail, n) => (n === 2 ? new Promise(() => {}) : undefined), { ackTimeoutMs });
+
+    const lines = [];
+    console.error = (...a) => lines.push(a.map(String).join(' '));
+    try {
+      const started = Date.now();
+      const res = await request(server, 'POST', '/api/contact', validPayload());
+      const elapsed = Date.now() - started;
+      assert.equal(res.status, 200);
+      assert.deepEqual(res.json, { ok: true });
+      assert.ok(elapsed < ackTimeoutMs, `response must not wait for the ack (took ${elapsed}ms)`);
+      assert.ok(!lines.some((l) => l.includes('ack send failed')), 'timeout has not fired yet at response time');
+
+      await waitForCalls(2);
+      assert.equal(sent.length, 1, 'ack is still pending');
+
+      await tick(ackTimeoutMs + 50);
+      const warn = lines.find((l) => l.includes('ack send failed'));
+      assert.ok(warn, 'timeout logged');
+      assert.ok(warn.includes('WARN'));
+      assert.ok(warn.includes('ETIMEDOUT'));
+    } finally {
+      console.error = () => {};
+    }
+  });
+
+  test('staff mail failure → 502 and no ack attempted', async () => {
+    await new Promise((r) => server.close(r));
+    await boot({}, async () => {
+      const e = new Error('smtp down');
+      e.code = 'ECONNECTION';
+      throw e;
+    });
+
+    const res = await request(server, 'POST', '/api/contact', validPayload());
+    assert.equal(res.status, 502);
+    await tick();
+    assert.equal(calls.length, 1, 'ack must not be sent when the staff mail failed');
+  });
+
+  test('CUSTOMER_ACK_ENABLED=false → only the staff mail is sent', async () => {
+    await new Promise((r) => server.close(r));
+    const envConfig = loadConfig({ CUSTOMER_ACK_ENABLED: 'false' });
+    await boot({ customerAckEnabled: envConfig.customerAckEnabled });
+
+    const res = await request(server, 'POST', '/api/contact', validPayload());
+    assert.equal(res.status, 200);
+    assert.deepEqual(res.json, { ok: true });
+    await tick();
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].to, 'info@enclu.co.kr');
+  });
+
+  test('buildCustomerAckMail: header fields pass through headerSafe', () => {
+    const mail = buildCustomerAckMail(baseConfig(), { ...validPayload(), email: 'a@example.com\u0000' }, { receivedAt: '2026-10-26T01:02:03.000Z' });
+    assert.equal(mail.to, 'a@example.com ');
+    assert.ok(!/[\r\n]/.test(mail.subject));
+    assert.ok(mail.text.includes('접수 시각: 2026. 10. 26.'));
+    assert.ok(mail.text.includes('(KST)'));
   });
 });

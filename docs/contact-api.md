@@ -32,6 +32,7 @@ SMTP_USER=noreply@enclu.co.kr
 SMTP_PASS=********
 MAIL_FROM="ENCLU 홈페이지 <noreply@enclu.co.kr>"
 MAIL_TO=info@enclu.co.kr
+CUSTOMER_ACK_ENABLED=true
 
 TURNSTILE_SECRET=0x4AAAAAAA...
 ALLOWED_ORIGINS=
@@ -43,12 +44,23 @@ ALLOWED_ORIGINS=
 | `SMTP_SECURE` | 465 포트면 `true`, 587 포트면 `false` |
 | `SMTP_USER` / `SMTP_PASS` | SMTP 로그인 계정. Gmail/Workspace 는 앱 비밀번호 사용 |
 | `MAIL_FROM` | 발신자 표시. SMTP 계정과 같은 도메인이어야 스팸 처리되지 않음 |
-| `MAIL_TO` | 수신자. 기본값 `info@enclu.co.kr` |
+| `MAIL_TO` | 수신자. 기본값 `info@enclu.co.kr`. 고객 확인 메일의 "추가 문의" 연락처로도 표시됨 |
+| `CUSTOMER_ACK_ENABLED` | 고객 접수 확인 메일 발송 여부. 기본 `true`. `false` 로 두면 담당자 알림만 발송 |
 | `NODE_ENV` | PM2 가 `production` 으로 고정. production 에서는 `TURNSTILE_SECRET` 이 없으면 **기동을 거부(exit 1)** 하므로 봇 검증이 빠진 채 운영될 수 없음. 로컬에서만 `development` 사용 |
 | `TURNSTILE_SECRET` | Cloudflare Turnstile **Secret key**. production 에서 필수. development/test 에서만 비울 수 있고 그때는 검증을 건너뛰며 기동 로그에 경고만 남김 |
 | `ALLOWED_ORIGINS` | 다른 도메인에서 호출할 때만 콤마로 나열. 비우면 CORS 헤더를 내보내지 않음(same-origin 전용) |
 
 > 제목은 `[홈페이지 문의] {문의 유형} - {회사명}`, 본문은 평문이며 `Reply-To` 가 문의자 이메일로 설정되어 메일 앱에서 바로 답장할 수 있습니다.
+
+### 고객 접수 확인 메일
+
+담당자 알림 메일이 **성공한 뒤** 문의자 이메일로 `[ENCLU] 문의가 정상 접수되었습니다` 확인 메일을 한 통 더 보냅니다(`CUSTOMER_ACK_ENABLED=true`, 기본).
+
+- 내용: ENCLU 헤더, "고객님" 고정 인사말, 접수 내역 요약(문의 유형·접수 시각), "담당자가 영업일 기준 1~2일 내 연락드립니다", 발신 전용 안내. HTML + 평문 두 버전이며 HTML 에 끼워 넣는 값은 모두 이스케이프됩니다.
+- **자유 입력은 되돌려 보내지 않습니다.** 성함·회사명·문의 본문은 확인 메일에 포함하지 않고, 문의 유형은 `index.html` 의 `<select name="type">` option 값(`server.js` 의 `INQUIRY_TYPES`)과 정확히 일치할 때만 표시하며 아니면 행 자체를 생략합니다. 임의 주소로 임의 문구(피싱 링크 등)를 중계하는 백스캐터·스팸 악용을 막기 위함입니다. select 항목을 바꾸면 `INQUIRY_TYPES` 도 함께 수정합니다.
+- `From` 은 `MAIL_FROM`, `Reply-To` 는 설정하지 않으며 `Auto-Submitted: auto-replied`, `X-Auto-Response-Suppress: All` 헤더를 붙여 부재중 자동회신과의 메일 루프를 막습니다.
+- 본문의 "추가 문의는 홈페이지 문의 폼 또는 {MAIL_TO} 로" 안내에는 `MAIL_TO` 값이 들어갑니다.
+- 확인 메일은 **`{"ok":true}` 응답을 보낸 뒤 비동기로** 발송하므로 SMTP 가 느려도 폼 응답이 지연되지 않습니다. 10초(`ACK_TIMEOUT_MS`) 안에 끝나지 않거나 실패하면(수신 주소 오류 등) 로그에 `ack send failed` 경고(`reason: ETIMEDOUT` 등)만 남고 응답에는 영향이 없습니다. 담당자에게는 이미 전달된 상태입니다.
 
 ### Cloudflare Turnstile 키 발급
 
@@ -131,7 +143,7 @@ curl -X POST https://www.enclu.co.kr/api/contact ^
   -d "{\"type\":\"기타\",\"company\":\"테스트\",\"name\":\"담당자\",\"email\":\"test@example.com\",\"phone\":\"010-0000-0000\",\"message\":\"발송 테스트\",\"consent\":true,\"website\":\"\",\"turnstileToken\":\"test\"}"
 ```
 
-기대 응답: `{"ok":true}` 이고 `info@enclu.co.kr` 에 `[홈페이지 문의] 기타 - 테스트` 메일 도착.
+기대 응답: `{"ok":true}` 이고 `info@enclu.co.kr` 에 `[홈페이지 문의] 기타 - 테스트` 메일 도착. `CUSTOMER_ACK_ENABLED` 가 켜져 있으면 `test@example.com` 에도 `[ENCLU] 문의가 정상 접수되었습니다` 확인 메일이 갑니다(실제 수신 가능한 주소로 바꿔 확인).
 
 | 응답 | 의미 |
 |---|---|
