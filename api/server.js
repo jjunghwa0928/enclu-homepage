@@ -11,6 +11,11 @@
  *   → /api/contact 5req/10min → 허니팟 → 필드 검증·CRLF 차단
  *   → Turnstile 검증(production 에서는 필수) → 중복 전송 가드(email+message 해시, 10분, 발송 성공 후 기록) → 메일 발송
  *
+ * 담당자(MAIL_TO) 알림 메일이 성공하면 고객(data.email)에게 접수 확인 메일을 추가로 보낸다
+ * (CUSTOMER_ACK_ENABLED, 기본 켜짐). 확인 메일은 200 응답을 보낸 뒤 비동기로 발송하며
+ * (ACK_TIMEOUT_MS 타임아웃), 실패·타임아웃은 경고 로그만 남긴다.
+ * 확인 메일에는 공격자가 임의로 채울 수 있는 자유 입력(성함·회사명·메시지)을 넣지 않는다.
+ *
  * 테스트에서는 createApp({ config, sendMail, verifyTurnstile }) 로
  * 네트워크를 쓰지 않는 가짜 구현을 주입한다.
  */
@@ -37,6 +42,21 @@ const LIMITS = {
 
 const DUPLICATE_WINDOW_MS = 10 * 60 * 1000;
 
+/** 고객 확인 메일 발송 대기 상한. 넘기면 경고 로그만 남기고 잊는다. */
+const ACK_TIMEOUT_MS = 10 * 1000;
+
+/**
+ * index.html <select name="type"> 의 option 값과 동일하게 유지한다.
+ * 고객 확인 메일에는 이 목록과 정확히 일치하는 문의 유형만 표시한다.
+ */
+const INQUIRY_TYPES = Object.freeze([
+  '브랜드 입점 문의',
+  '플랫폼 제휴 문의',
+  'Weedy 관련 문의',
+  '수출바우처 문의',
+  '기타'
+]);
+
 // ---------------------------------------------------------------------------
 // 설정
 // ---------------------------------------------------------------------------
@@ -61,7 +81,9 @@ function loadConfig(env = process.env) {
     mailFrom: env.MAIL_FROM || env.SMTP_USER || 'noreply@enclu.co.kr',
     mailTo: env.MAIL_TO || 'info@enclu.co.kr',
     turnstileSecret: env.TURNSTILE_SECRET || '',
-    allowedOrigins
+    allowedOrigins,
+    // 고객 접수 확인 메일. "false" 로 명시했을 때만 끈다.
+    customerAckEnabled: bool(env.CUSTOMER_ACK_ENABLED, true)
   };
 }
 
@@ -188,6 +210,119 @@ function buildMail(config, data, meta) {
   };
 }
 
+/** HTML 본문에 끼워 넣는 사용자 입력 이스케이프 */
+function escapeHtml(s) {
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+/** 접수 시각을 고객이 읽기 쉬운 한국 시간 문자열로 */
+function formatReceivedAt(iso) {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return String(iso);
+  return `${d.toLocaleString('ko-KR', { timeZone: 'Asia/Seoul', hour12: false })} (KST)`;
+}
+
+/**
+ * 고객 접수 확인 메일.
+ * - 공격자가 임의 주소로 임의 문구를 보내는 데 쓰이지 않도록, 자유 입력(성함·회사명·메시지)은
+ *   일절 넣지 않는다. 문의 유형도 INQUIRY_TYPES 와 정확히 일치할 때만 표시한다.
+ * - Reply-To 를 설정하지 않고 자동응답 헤더를 붙여 메일 루프·부재중 자동회신을 막는다.
+ */
+function buildCustomerAckMail(config, data, meta) {
+  const receivedAt = formatReceivedAt(meta.receivedAt);
+  const contact = config.mailTo;
+  const noReplyNotice = `본 메일은 발신 전용(no-reply)이므로 회신하지 마세요. 추가 문의는 홈페이지 문의 폼 또는 ${contact} 로 보내주세요.`;
+
+  const summary = [];
+  if (INQUIRY_TYPES.includes(data.type)) summary.push(['문의 유형', data.type]);
+  summary.push(['접수 시각', receivedAt]);
+
+  const text = [
+    'ENCLU',
+    '',
+    '문의가 정상 접수되었습니다.',
+    '',
+    '고객님, ENCLU 에 문의해 주셔서 감사합니다. 접수 내역은 아래와 같습니다.',
+    '',
+    ...summary.map(([k, v]) => `${k}: ${v}`),
+    '',
+    '담당자가 영업일 기준 1~2일 내 연락드립니다.',
+    '',
+    `※ ${noReplyNotice}`,
+    '',
+    '— ENCLU'
+  ].join('\n');
+
+  const rows = summary
+    .map(
+      ([k, v]) =>
+        `<tr><th align="left" style="padding:6px 12px 6px 0;color:#6b7280;font-weight:600;white-space:nowrap;">${escapeHtml(k)}</th>` +
+        `<td style="padding:6px 0;color:#111827;">${escapeHtml(v)}</td></tr>`
+    )
+    .join('');
+
+  const html = [
+    '<!DOCTYPE html>',
+    '<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>문의 접수 확인</title></head>',
+    '<body style="margin:0;padding:24px;background:#f3f4f6;font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',Roboto,\'Apple SD Gothic Neo\',\'Malgun Gothic\',sans-serif;color:#111827;">',
+    '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:560px;margin:0 auto;background:#ffffff;border-radius:8px;overflow:hidden;">',
+    '<tr><td style="background:#111827;padding:20px 28px;color:#ffffff;font-size:20px;font-weight:700;letter-spacing:0.12em;">ENCLU</td></tr>',
+    '<tr><td style="padding:28px;">',
+    '<h1 style="margin:0 0 16px;font-size:20px;line-height:1.4;">문의가 정상 접수되었습니다.</h1>',
+    '<p style="margin:0 0 20px;font-size:15px;line-height:1.6;">고객님, ENCLU 에 문의해 주셔서 감사합니다. 접수 내역은 아래와 같습니다.</p>',
+    `<table role="presentation" cellpadding="0" cellspacing="0" style="font-size:14px;line-height:1.5;margin:0 0 20px;">${rows}</table>`,
+    '<p style="margin:0 0 24px;font-size:15px;line-height:1.6;">담당자가 영업일 기준 1~2일 내 연락드립니다.</p>',
+    `<div style="padding:14px 16px;background:#fef3c7;border:1px solid #f59e0b;border-radius:6px;font-size:14px;line-height:1.6;color:#78350f;"><strong>${escapeHtml(noReplyNotice)}</strong></div>`,
+    '</td></tr>',
+    '<tr><td style="padding:16px 28px;border-top:1px solid #e5e7eb;font-size:12px;color:#6b7280;">— ENCLU</td></tr>',
+    '</table>',
+    '</body></html>'
+  ].join('');
+
+  return {
+    from: config.mailFrom,
+    to: headerSafe(data.email),
+    subject: headerSafe('[ENCLU] 문의가 정상 접수되었습니다'),
+    text,
+    html,
+    headers: {
+      'Auto-Submitted': 'auto-replied',
+      'X-Auto-Response-Suppress': 'All'
+    }
+  };
+}
+
+/**
+ * 고객 확인 메일을 응답과 무관하게 비동기로 보낸다 (fire-and-forget).
+ * timeoutMs 안에 끝나지 않거나 실패하면 경고 로그만 남기며, 어떤 경우에도 reject 를 밖으로 내보내지 않는다.
+ * 반환된 Promise 는 항상 resolve 되므로 테스트에서 기다리는 용도로만 쓴다.
+ */
+function sendCustomerAck(sendMail, mail, timeoutMs, ip) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      const e = new Error('customer ack timed out');
+      e.code = 'ETIMEDOUT';
+      reject(e);
+    }, timeoutMs);
+    if (typeof timer.unref === 'function') timer.unref();
+  });
+
+  return Promise.race([Promise.resolve().then(() => sendMail(mail)), timeout])
+    .then(() => {
+      log('info', 'ack sent', { ip });
+    })
+    .catch((err) => {
+      log('warn', 'ack send failed', { ip, reason: err && err.code ? err.code : 'unknown' });
+    })
+    .finally(() => clearTimeout(timer));
+}
+
 // ---------------------------------------------------------------------------
 // 중복 전송 가드 (메모리)
 // ---------------------------------------------------------------------------
@@ -279,6 +414,7 @@ function createApp(options = {}) {
   const sendMail = options.sendMail || createSmtpSender(config);
   const verifyTurnstile = options.verifyTurnstile || verifyTurnstileRemote;
   const duplicates = options.duplicateGuard || createDuplicateGuard();
+  const ackTimeoutMs = Number.isFinite(options.ackTimeoutMs) ? options.ackTimeoutMs : ACK_TIMEOUT_MS;
 
   const app = express();
   app.disable('x-powered-by');
@@ -331,16 +467,23 @@ function createApp(options = {}) {
       return res.status(429).json({ ok: false, error: 'duplicate' });
     }
 
-    // 5) 발송
-    const mail = buildMail(config, data, { ip, receivedAt: new Date().toISOString() });
+    // 5) 발송 — 담당자 알림이 핵심. 실패하면 502.
+    const meta = { ip, receivedAt: new Date().toISOString() };
+    const mail = buildMail(config, data, meta);
     try {
       await sendMail(mail);
       duplicates.remember(data.email, data.message);
       log('info', 'sent', { ip, type: data.type });
-      return res.json({ ok: true });
     } catch (err) {
       log('error', 'send failed', { ip, reason: err && err.code ? err.code : 'unknown' });
       return res.status(502).json({ ok: false, error: 'send_failed' });
+    }
+
+    res.json({ ok: true });
+
+    // 6) 고객 접수 확인 — 응답을 보낸 뒤 비동기로. 실패·타임아웃은 로그만 남긴다 (접수 자체는 이미 완료).
+    if (config.customerAckEnabled) {
+      sendCustomerAck(sendMail, buildCustomerAckMail(config, data, meta), ackTimeoutMs, ip);
     }
   });
 
@@ -391,4 +534,15 @@ function start() {
 
 if (require.main === module) start();
 
-module.exports = { createApp, loadConfig, startupError, validateContact, buildMail, createDuplicateGuard, LIMITS };
+module.exports = {
+  createApp,
+  loadConfig,
+  startupError,
+  validateContact,
+  buildMail,
+  buildCustomerAckMail,
+  createDuplicateGuard,
+  LIMITS,
+  INQUIRY_TYPES,
+  ACK_TIMEOUT_MS
+};
