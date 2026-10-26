@@ -391,6 +391,25 @@
     html{scroll-behavior:auto;}
   }
 
+  /* ---------- interactive motion (progress / hero glow / tilt / magnet / parallax / text reveal) ---------- */
+  .scroll-progress{position:fixed;top:0;left:0;width:100%;height:2px;background:var(--blue);transform:scaleX(0);transform-origin:0 50%;z-index:250;pointer-events:none;}
+  .hero{position:relative;isolation:isolate;}
+  .hero-glow{position:absolute;inset:0;z-index:-1;pointer-events:none;opacity:0;transition:opacity .5s ease;
+    background:radial-gradient(520px circle at var(--gx,50%) var(--gy,30%),rgba(0,113,227,.13),rgba(0,113,227,0) 70%);}
+  .hero-glow.on{opacity:1;}
+  .hero-content{transform:translate3d(calc(var(--hx,0)*8px),calc(var(--hy,0)*8px),0);will-change:transform;}
+  .hero-logo-mark{transform:translate3d(calc(var(--hx,0)*-10px),calc(var(--hy,0)*-10px),0);will-change:transform;}
+  .tilt{transform-style:preserve-3d;will-change:transform;}
+  .tilt.tilt-live{transition:opacity .7s ease;}
+  .magnet{transform:translate3d(var(--mx,0px),var(--my,0px),0);will-change:transform;}
+  [data-reveal].magnet.pre.in{transform:translate3d(var(--mx,0px),var(--my,0px),0);transition:opacity .7s ease,transform .25s ease;}
+  .float-cta.magnet{transform:translate3d(var(--mx,0px),calc(var(--my,0px) + 12px),0);}
+  .float-cta.magnet.show{transform:translate3d(var(--mx,0px),var(--my,0px),0);}
+  .plx{will-change:transform;}
+  .tr .w{display:inline-block;opacity:0;transform:translateY(.5em);transition:opacity .6s ease,transform .6s cubic-bezier(.2,.7,.25,1);transition-delay:var(--d,0ms);}
+  .tr.tr-in .w{opacity:1;transform:none;}
+  .hero h1 .w{color:inherit;}
+
   @media (max-width:860px){
     nav.nav-links{display:none;}
     .navbar{justify-content:space-between;}
@@ -427,11 +446,13 @@
   <!-- 히어로 -->
   <section class="hero" data-screen-label="히어로">
     <img class="hero-logo-mark" src="assets/hero-mascot.png" alt="ENCLU 마스코트">
+    <div class="hero-content">
     <h1>일본 시장 진출,<br><span>어떻게 성장하느냐</span>가 중요합니다.</h1>
     <p class="hero-sub">브랜드사를 생각하는 엔클루</p>
     <div class="hero-ctas">
       <a class="pill" href="#contact" onclick="scrollToId('contact');return false;">무료로 문의하기</a>
       <a class="pill outline" href="#about" onclick="scrollToId('about');return false;">서비스 살펴보기</a>
+    </div>
     </div>
 
     <div class="service-block wrap">
@@ -1036,6 +1057,167 @@
     }, 2500);
   }
   initReveal();
+</script>
+<script>
+(function(){
+  'use strict';
+  var d=document, w=window, raf=w.requestAnimationFrame;
+  var reduced=w.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  var pointerOK=!reduced && !w.matchMedia('(hover: none)').matches;
+  function clamp(v,a,b){return v<a?a:v>b?b:v;}
+  function lerp(a,b,t){return a+(b-a)*t;}
+  // rAF loop that runs only while step() returns true, then stops
+  function ticker(step){var id=0;function frame(){id=0;if(step())id=raf(frame);}return function(){if(!id)id=raf(frame);};}
+
+  // 1. scroll progress bar + 5. scroll parallax (single rAF-throttled scroll handler)
+  var bar=d.createElement('div');bar.className='scroll-progress';bar.setAttribute('aria-hidden','true');d.body.appendChild(bar);
+  var plx=[];
+  if(!reduced){
+    [['#how .step-card img',10],['#weedy .weedy-right img',30]].forEach(function(c){
+      d.querySelectorAll(c[0]).forEach(function(el){el.classList.add('plx');plx.push({el:el,amp:c[1],cur:0});});
+    });
+  }
+  var queued=false;
+  function onScroll(){
+    queued=false;
+    var h=d.documentElement, max=h.scrollHeight-h.clientHeight, vh=h.clientHeight;
+    bar.style.transform='scaleX('+(max>0?clamp(w.scrollY/max,0,1):0).toFixed(4)+')';
+    plx.forEach(function(it){
+      var r=it.el.getBoundingClientRect();
+      var k=clamp((r.top-it.cur+r.height/2-vh/2)/vh,-1,1);
+      it.cur=-k*it.amp;
+      it.el.style.transform='translate3d(0,'+it.cur.toFixed(2)+'px,0)';
+    });
+  }
+  function queue(){if(!queued){queued=true;raf(onScroll);}}
+  w.addEventListener('scroll',queue,{passive:true});
+  w.addEventListener('resize',queue,{passive:true});
+  queue();
+
+  // 2. hero cursor glow + mouse parallax
+  var hero=d.querySelector('section.hero');
+  if(pointerOK&&hero&&d.querySelector('.hero-content')){
+    var glow=d.createElement('div');glow.className='hero-glow';glow.setAttribute('aria-hidden','true');hero.appendChild(glow);
+    var hx=0,hy=0,tx=0,ty=0,gx=0,gy=0,cx=0,cy=0;
+    var kickHero=ticker(function(){
+      hx=lerp(hx,tx,.12);hy=lerp(hy,ty,.12);cx=lerp(cx,gx,.18);cy=lerp(cy,gy,.18);
+      var done=Math.abs(hx-tx)<.002&&Math.abs(hy-ty)<.002&&Math.abs(cx-gx)<.5&&Math.abs(cy-gy)<.5;
+      if(done){hx=tx;hy=ty;cx=gx;cy=gy;}
+      hero.style.setProperty('--hx',hx.toFixed(4));hero.style.setProperty('--hy',hy.toFixed(4));
+      glow.style.setProperty('--gx',cx.toFixed(1)+'px');glow.style.setProperty('--gy',cy.toFixed(1)+'px');
+      return !done;
+    });
+    hero.addEventListener('pointermove',function(e){
+      var r=hero.getBoundingClientRect();
+      gx=e.clientX-r.left;gy=e.clientY-r.top;
+      if(!glow.classList.contains('on')){cx=gx;cy=gy;glow.classList.add('on');}
+      tx=clamp(gx/r.width*2-1,-1,1);ty=clamp(gy/r.height*2-1,-1,1);
+      kickHero();
+    });
+    hero.addEventListener('pointerleave',function(){tx=0;ty=0;glow.classList.remove('on');kickHero();});
+  }
+
+  // 3. 3D tilt cards
+  if(pointerOK){
+    d.querySelectorAll('.about-card,.step-card,.logi-card,.weedy-card').forEach(function(card){
+      card.classList.add('tilt');
+      var rx=0,ry=0,sc=1,trx=0,tryy=0,tsc=1,on=false;
+      var kick=ticker(function(){
+        rx=lerp(rx,trx,.15);ry=lerp(ry,tryy,.15);sc=lerp(sc,tsc,.15);
+        var done=Math.abs(rx-trx)<.01&&Math.abs(ry-tryy)<.01&&Math.abs(sc-tsc)<.0005;
+        if(done&&!on){rx=0;ry=0;sc=1;card.style.transform='';card.classList.remove('tilt-live');return false;}
+        card.style.transform='perspective(900px) rotateX('+rx.toFixed(2)+'deg) rotateY('+ry.toFixed(2)+'deg) scale('+sc.toFixed(4)+')';
+        return !done;
+      });
+      card.addEventListener('pointermove',function(e){
+        var r=card.getBoundingClientRect();
+        var px=clamp((e.clientX-r.left)/r.width,0,1), py=clamp((e.clientY-r.top)/r.height,0,1);
+        tryy=(px-.5)*12;trx=(.5-py)*12;tsc=1.01;on=true;
+        card.classList.add('tilt-live');kick();
+      });
+      card.addEventListener('pointerleave',function(){trx=0;tryy=0;tsc=1;on=false;kick();});
+    });
+  }
+
+  // 4. magnetic buttons
+  if(pointerOK){
+    var sel='.hero-ctas a,.cta,.nav-cta,.float-cta,.weedy-store-btn', mags=[];
+    d.querySelectorAll(sel).forEach(function(el){
+      if(el.parentElement&&el.parentElement.closest(sel))return; // nested magnet (e.g. .cta inside store btn): parent only
+      el.classList.add('magnet');mags.push({el:el,x:0,y:0,tx:0,ty:0});
+    });
+    var kickMag=ticker(function(){
+      var active=false;
+      mags.forEach(function(m){
+        if(m.x===m.tx&&m.y===m.ty)return;
+        m.x=lerp(m.x,m.tx,.18);m.y=lerp(m.y,m.ty,.18);
+        if(Math.abs(m.x-m.tx)<.05&&Math.abs(m.y-m.ty)<.05){m.x=m.tx;m.y=m.ty;}else active=true;
+        m.el.style.setProperty('--mx',m.x.toFixed(2)+'px');m.el.style.setProperty('--my',m.y.toFixed(2)+'px');
+      });
+      return active;
+    });
+    if(mags.length)d.addEventListener('pointermove',function(e){
+      var changed=false;
+      mags.forEach(function(m){
+        var r=m.el.getBoundingClientRect();if(!r.width)return;
+        var hw=r.width/2+80,hh=r.height/2+80,dx=e.clientX-(r.left+r.width/2)+m.x,dy=e.clientY-(r.top+r.height/2)+m.y,tx=0,ty=0;
+        if(Math.abs(dx)<hw&&Math.abs(dy)<hh){tx=dx/hw*12;ty=dy/hh*12;}
+        if(tx!==m.tx||ty!==m.ty){m.tx=tx;m.ty=ty;changed=true;}
+      });
+      if(changed)kickMag();
+    },{passive:true});
+  }
+
+  // 6. word-stagger text reveal on hero h1 + first h2 of each section
+  if(!reduced&&'IntersectionObserver' in w){
+    var INLINE={SPAN:1,B:1,STRONG:1,EM:1,I:1};
+    function split(h){
+      var items=[],cur=null,ok=true;
+      (function walk(node,path){
+        for(var n=node.firstChild;n&&ok;n=n.nextSibling){
+          if(n.nodeType===3){
+            n.nodeValue.split(/(\s+)/).forEach(function(piece){
+              if(!piece)return;
+              if(/^\s+$/.test(piece)){cur=null;items.push(' ');return;}
+              if(!cur){cur=[];items.push(cur);}
+              cur.push({t:piece,p:path});
+            });
+          }else if(n.nodeType===1){
+            if(n.tagName==='BR'){cur=null;items.push('br');}
+            else if(INLINE[n.tagName])walk(n,path.concat(n));
+            else ok=false;
+          }
+        }
+      })(h,[]);
+      if(!ok||items.length<2)return false;
+      var frag=d.createDocumentFragment(),i=0;
+      items.forEach(function(it){
+        if(it===' '){frag.appendChild(d.createTextNode(' '));return;}
+        if(it==='br'){frag.appendChild(d.createElement('br'));return;}
+        var word=d.createElement('span');word.className='w';word.style.setProperty('--d',Math.min(i++*60,720)+'ms');
+        it.forEach(function(f){
+          var host=word;
+          f.p.forEach(function(anc){var c=anc.cloneNode(false);host.appendChild(c);host=c;});
+          host.appendChild(d.createTextNode(f.t));
+        });
+        frag.appendChild(word);
+      });
+      h.textContent='';h.appendChild(frag);h.classList.add('tr');
+      return true;
+    }
+    var heads=[],h1=d.querySelector('.hero h1');
+    if(h1)heads.push(h1);
+    d.querySelectorAll('section').forEach(function(s){var h=s.querySelector('h2');if(h&&heads.indexOf(h)<0)heads.push(h);});
+    heads=heads.filter(split);
+    if(heads.length){
+      var io=new IntersectionObserver(function(entries){
+        entries.forEach(function(en){if(en.isIntersecting){en.target.classList.add('tr-in');io.unobserve(en.target);}});
+      },{rootMargin:'0px 0px -40px 0px'});
+      heads.forEach(function(h){io.observe(h);});
+      setTimeout(function(){heads.forEach(function(h){h.classList.add('tr-in');});},3000);
+    }
+  }
+})();
 </script>
 </body>
 </html>
